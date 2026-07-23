@@ -115,19 +115,19 @@ TTF glyph는 contour/component 유무로, OTF glyph는 계산된 outline bounds 
 
 요청한 minimum/maximum은 output `wght` axis range가 됩니다. 요청 범위가 Base 범위 밖으로 나가면 해당 구간의 outline은 가장 가까운 Base 경계 값으로 clamp합니다. 예를 들어 Base가 `300–900`일 때 output을 `100–900`으로 만들면 `100–300`은 Base `300` outline과 같습니다.
 
-Donor는 실제로 사용되는 Base 구간을 포함해야 합니다. 포함하지 않으면 의도하지 않은 Donor extrapolation을 피하기 위해 build를 중단합니다.
-
 TTF output range가 Base range 안에 있고 source에 별도 metric/axis variation table이 없으면 subset된 source `fvar/gvar`를 output axis에 맞게 normalize한 뒤 직접 결합합니다. 이 경로는 source outline interpolation을 보존하고 불필요한 intermediate `gvar` tuple을 만들지 않으며, output에 weight별 `fvar` named instance와 `STAT AxisValue`를 생성합니다.
 
 요청 range가 Base range 밖으로 나가 clamp가 필요하거나 source variation table을 직접 결합할 수 없는 경우에는 요청 경계, Base default, 실제 구간 경계, 100 단위 weight, Base/Donor named instance의 weight에서 static master를 만든 뒤 `fontTools.varLib`으로 다시 구성합니다. 이 fallback에서는 sample 사이의 outline이 새 interpolation 결과이므로 source의 숨은 variation breakpoint와 완전히 같다고 보장하지 않습니다.
 
+## Layout과 variation 처리
+
+- TTF와 OTF 모두 subset dependency glyph와 Base/Donor의 `GSUB`, `GPOS`, `GDEF`를 merge합니다. OTF static master는 CID-keyed CFF를 포함해 dehinted name-keyed CFF로 normalize한 뒤 layout과 outline을 함께 merge하고 `fontTools.varLib`으로 CFF2 output을 구성합니다.
+- Base와 Donor의 weight-dependent `GSUB FeatureVariations`와 `GPOS FeatureVariations`는 output `wght` condition에 맞춰 재구성합니다. `SingleSubst`, `MultipleSubst`, `AlternateSubst`, `LigatureSubst`, positioning, contextual lookup과 Extension lookup을 포함한 전체 alternate feature lookup graph를 보존합니다.
+- GPOS의 `VariationIndex`가 참조하는 `GDEF VarStore` region과 `avar` kink를 breakpoint로 반영해 positioning 값을 재구성합니다. direct TTF path는 source `gvar/fvar`를 직접 결합한 뒤 이 GPOS/GDEF 결과만 교체하므로 outline variation 구조는 그대로 유지합니다.
+
 ## 현재 제약
 
 - output은 안전한 subset/merge를 위해 dehinted font로 생성됩니다.
-- TTF와 OTF 모두 subset dependency glyph와 Base/Donor의 `GSUB`, `GPOS`, `GDEF`를 merge합니다. OTF static master는 CID-keyed CFF를 포함해 dehinted name-keyed CFF로 normalize한 뒤 layout과 outline을 함께 merge하고 `fontTools.varLib`으로 CFF2 output을 구성합니다.
-- Base와 Donor의 weight-dependent `GSUB FeatureVariations`와 `GPOS FeatureVariations`는 output `wght` condition에 맞춰 재구성합니다. `SingleSubst`, `MultipleSubst`, `AlternateSubst`, `LigatureSubst`, positioning, contextual lookup과 Extension lookup을 포함한 전체 alternate feature lookup graph를 보존합니다.
-- GPOS의 `VariationIndex`가 참조하는 `GDEF VarStore` region과 `avar` kink를 weight sample에 포함해 positioning 값을 재구성합니다. direct TTF path는 source `gvar/fvar`를 직접 결합한 뒤 이 GPOS/GDEF 결과만 교체하므로 outline variation 구조는 그대로 유지합니다.
-- Static master fallback에서 큰 CJK group을 선택하면 여러 master의 모든 outline을 처리하므로 build에 시간이 걸리고 output 용량이 커질 수 있습니다.
 
 ## 검증
 
