@@ -401,7 +401,7 @@ fn render_done(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(format!("Donor repaired  {}", result.donor_repaired)),
             Line::from(format!("Donor added     {}", result.donor_added)),
             Line::from(format!("Unavailable     {}", result.unavailable)),
-            Line::from(format!("Master samples  {:?}", result.sample_weights)),
+            Line::from(format!("Weight samples  {:?}", result.sample_weights)),
             Line::from(""),
             Line::from("Enter 또는 Q: quit"),
         ]

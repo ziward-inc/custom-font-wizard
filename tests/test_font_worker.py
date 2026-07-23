@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from typing import cast
 
 from fontTools.pens.recordingPen import RecordingPen
 from fontTools.ttLib import TTFont
+from fontTools.ttLib.scaleUpem import scale_upem
 from fontTools.varLib.instancer import instantiateVariableFont
 
-from worker.font_engine import BuildStep, BuildStepStatus, analyze_fonts, build_font
+from worker.font_engine import BuildStep, BuildStepStatus, analyze_fonts, build_font, subset_font
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 BASE_TTF: Path = PROJECT_ROOT / "SUITE-Variable-ttf/SUITE-Variable.ttf"
@@ -107,9 +109,99 @@ class FontWorkerTests(unittest.TestCase):
             self.assertEqual(set(font.getBestCmap() or {}), {0x30AC})
             font.close()
 
+    def test_build_preserves_ttf_variations_and_adds_weight_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
+            output_path: Path = Path(temporary_directory) / "Direct.ttf"
+            family_name: str = "Custom Font Wizard Direct Test"
+            build_font(
+                base_path=BASE_TTF,
+                donor_path=DONOR_TTF,
+                output_path=output_path,
+                family_name=family_name,
+                weight_min=300,
+                weight_max=900,
+                selected_codepoints=[0x0041, 0x30AC, 0xAC02],
+            )
+
+            font: TTFont = TTFont(output_path)
+            instances: list[tuple[float, str | None]] = [
+                (float(instance.coordinates["wght"]), font["name"].getDebugName(instance.subfamilyNameID))
+                for instance in font["fvar"].instances
+            ]
+            self.assertEqual(
+                instances,
+                [
+                    (300, "Light"),
+                    (400, "Regular"),
+                    (500, "Medium"),
+                    (600, "SemiBold"),
+                    (700, "Bold"),
+                    (800, "ExtraBold"),
+                    (900, "Heavy"),
+                ],
+            )
+            self.assertEqual(font["name"].getDebugName(1), f"{family_name} Light")
+            self.assertEqual(font["name"].getDebugName(16), family_name)
+            self.assertEqual(font["name"].getDebugName(17), "Light")
+            stat_values = font["STAT"].table.AxisValueArray.AxisValue
+            self.assertEqual({float(value.Value) for value in stat_values}, set(range(300, 901, 100)))
+            self.assertNotIn("HVAR", font)
+            font.close()
+
+            for codepoint, source_path, should_scale in (
+                (0x0041, BASE_TTF, False),
+                (0xAC02, DONOR_TTF, True),
+            ):
+                self.assertEqual(
+                    outline_at(font_path=output_path, codepoint=codepoint, weight=500),
+                    source_outline_at(
+                        font_path=source_path,
+                        codepoint=codepoint,
+                        weight=500,
+                        scale_to_base=should_scale,
+                    ),
+                )
+            self.assertNotEqual(
+                outline_at(font_path=output_path, codepoint=0xAC02, weight=300),
+                outline_at(font_path=output_path, codepoint=0xAC02, weight=900),
+            )
+
 
 def outline_at(*, font_path: Path, codepoint: int, weight: float) -> list[tuple[str, tuple[object, ...]]]:
     font: TTFont = TTFont(font_path)
+    instance: TTFont = instantiateVariableFont(font, {"wght": weight}, inplace=True, static=True)
+    cmap: dict[int, str] = dict(instance.getBestCmap() or {})
+    glyph_name: str = cmap[codepoint]
+    pen = RecordingPen()
+    instance.getGlyphSet()[glyph_name].draw(pen)
+    outline: list[tuple[str, tuple[object, ...]]] = list(pen.value)
+    instance.close()
+    return outline
+
+
+def source_outline_at(
+    *,
+    font_path: Path,
+    codepoint: int,
+    weight: float,
+    scale_to_base: bool,
+) -> list[tuple[str, tuple[object, ...]]]:
+    font: TTFont = TTFont(font_path)
+    font = instantiateVariableFont(font, {"wght": (300, 300, 900)}, inplace=True, static=False)
+    if scale_to_base:
+        base_font: TTFont = TTFont(BASE_TTF)
+        base_upem: int = cast("int", getattr(base_font["head"], "unitsPerEm"))
+        scale_upem(font, base_upem)
+        base_font.close()
+    for glyph_name in font.getGlyphOrder():
+        if glyph_name not in font["gvar"].variations:
+            font["gvar"].variations[glyph_name] = []
+    subset_font(font=font, codepoints={codepoint})
+    compiled_font = BytesIO()
+    font.save(compiled_font)
+    font.close()
+    compiled_font.seek(0)
+    font = TTFont(compiled_font)
     instance: TTFont = instantiateVariableFont(font, {"wght": weight}, inplace=True, static=True)
     cmap: dict[int, str] = dict(instance.getBestCmap() or {})
     glyph_name: str = cmap[codepoint]
