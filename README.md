@@ -125,10 +125,6 @@ TTF output range가 Base range 안에 있고 source에 별도 metric/axis variat
 - Base와 Donor의 weight-dependent `GSUB FeatureVariations`와 `GPOS FeatureVariations`는 output `wght` condition에 맞춰 재구성합니다. `SingleSubst`, `MultipleSubst`, `AlternateSubst`, `LigatureSubst`, positioning, contextual lookup과 Extension lookup을 포함한 전체 alternate feature lookup graph를 보존합니다.
 - GPOS의 `VariationIndex`가 참조하는 `GDEF VarStore` region과 `avar` kink를 breakpoint로 반영해 positioning 값을 재구성합니다. direct TTF path는 source `gvar/fvar`를 직접 결합한 뒤 이 GPOS/GDEF 결과만 교체하므로 outline variation 구조는 그대로 유지합니다.
 
-## 현재 제약
-
-- output은 안전한 subset/merge를 위해 dehinted font로 생성됩니다.
-
 ## 검증
 
 ```sh
