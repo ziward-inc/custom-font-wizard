@@ -1,0 +1,20 @@
+[project]
+name = "custom-font-wizard-worker"
+version = "0.1.0"
+description = "fontTools worker for Custom Font Wizard"
+requires-python = ">=3.12"
+dependencies = [
+    "fonttools>=4.63,<5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12",
+    "ty>=0.0.1a16",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

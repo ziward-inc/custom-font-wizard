@@ -1,0 +1,16 @@
+[package]
+name = "custom-font-wizard"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive TUI for completing variable fonts from a donor font"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+ratatui = "0.30"
+rfd = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-general-category = "1.1"
+unicode-script = "0.5"
