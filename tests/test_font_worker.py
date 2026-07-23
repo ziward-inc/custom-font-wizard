@@ -6,9 +6,12 @@ from io import BytesIO
 from pathlib import Path
 from typing import cast
 
+from fontTools.otlLib.builder import buildLookup
 from fontTools.pens.recordingPen import RecordingPen
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.scaleUpem import scale_upem
+from fontTools.ttLib.tables import otTables
+from fontTools.varLib.featureVars import addFeatureVariations, addFeatureVariationsRaw
 from fontTools.varLib.instancer import instantiateVariableFont
 
 from worker.font_engine import BuildStep, BuildStepStatus, analyze_fonts, build_font, subset_font
@@ -148,6 +151,60 @@ class FontWorkerTests(unittest.TestCase):
                     substituted_glyph_at(font_path=DONOR_TTF, codepoint=0x30AC, weight=weight),
                 )
 
+    def test_build_preserves_base_gsub_feature_variations(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
+            temporary_root: Path = Path(temporary_directory)
+            base_path: Path = temporary_root / "BaseFeatureVariations.ttf"
+            add_base_feature_variations(output_path=base_path)
+
+            for weight_min, weight_max in ((300, 900), (100, 700)):
+                with self.subTest(weight_min=weight_min, weight_max=weight_max):
+                    output_path: Path = temporary_root / f"Base-{weight_min}-{weight_max}.ttf"
+                    build_font(
+                        base_path=base_path,
+                        donor_path=DONOR_TTF,
+                        output_path=output_path,
+                        family_name="Custom Font Wizard Base Feature Variations Test",
+                        weight_min=weight_min,
+                        weight_max=weight_max,
+                        selected_codepoints=[0x0041],
+                    )
+
+                    self.assertEqual(
+                        substituted_glyph_at(font_path=output_path, codepoint=0x0041, weight=400),
+                        "A",
+                    )
+                    self.assertEqual(
+                        substituted_glyph_at(font_path=output_path, codepoint=0x0041, weight=600),
+                        "B",
+                    )
+
+    def test_build_preserves_donor_non_single_subst_feature_variations(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
+            temporary_root: Path = Path(temporary_directory)
+            donor_path: Path = temporary_root / "DonorMultipleSubst.ttf"
+            add_donor_multiple_subst_feature_variations(output_path=donor_path)
+            output_path: Path = temporary_root / "DonorMultipleSubstOutput.ttf"
+
+            build_font(
+                base_path=BASE_TTF,
+                donor_path=donor_path,
+                output_path=output_path,
+                family_name="Custom Font Wizard Donor MultipleSubst Test",
+                weight_min=100,
+                weight_max=700,
+                selected_codepoints=[0x30AC],
+            )
+
+            self.assertEqual(
+                multiple_substitution_at(font_path=output_path, codepoint=0x30AC, weight=400),
+                (),
+            )
+            self.assertEqual(
+                multiple_substitution_at(font_path=output_path, codepoint=0x30AC, weight=650),
+                ("uni30AB", "uni30AD"),
+            )
+
     def test_build_preserves_ttf_variations_and_adds_weight_metadata(self) -> None:
         with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
             output_path: Path = Path(temporary_directory) / "Direct.ttf"
@@ -243,6 +300,27 @@ def substituted_glyph_at(*, font_path: Path, codepoint: int, weight: float) -> s
     return glyph_name
 
 
+def multiple_substitution_at(*, font_path: Path, codepoint: int, weight: float) -> tuple[str, ...]:
+    font: TTFont = TTFont(font_path)
+    instance: TTFont = instantiateVariableFont(font, {"wght": weight}, inplace=True, static=True)
+    glyph_name: str = dict(instance.getBestCmap() or {})[codepoint]
+    gsub = instance["GSUB"].table
+    substitutions: tuple[str, ...] = ()
+    for feature_record in gsub.FeatureList.FeatureRecord:
+        if feature_record.FeatureTag != "rlig":
+            continue
+        for lookup_index in feature_record.Feature.LookupListIndex:
+            lookup = gsub.LookupList.Lookup[lookup_index]
+            for subtable in lookup.SubTable:
+                multiple_subst = subtable.ExtSubTable if lookup.LookupType == 7 else subtable
+                targets: list[str] | None = getattr(multiple_subst, "mapping", {}).get(glyph_name)
+                if lookup.LookupType in {2, 7} and targets is not None:
+                    substitutions = tuple(targets)
+                    break
+    instance.close()
+    return substitutions
+
+
 def substituted_outline_at(
     *,
     font_path: Path,
@@ -263,10 +341,15 @@ def substituted_glyph(*, font: TTFont, codepoint: int) -> str:
     glyph_name: str = dict(font.getBestCmap() or {})[codepoint]
     gsub = font["GSUB"].table
     feature = next(
-        feature_record.Feature
-        for feature_record in gsub.FeatureList.FeatureRecord
-        if feature_record.FeatureTag == "rlig"
+        (
+            feature_record.Feature
+            for feature_record in gsub.FeatureList.FeatureRecord
+            if feature_record.FeatureTag == "rlig"
+        ),
+        None,
     )
+    if feature is None:
+        return glyph_name
     for lookup_index in feature.LookupListIndex:
         lookup = gsub.LookupList.Lookup[lookup_index]
         for subtable in lookup.SubTable:
@@ -276,6 +359,39 @@ def substituted_glyph(*, font: TTFont, codepoint: int) -> str:
                 glyph_name = target
                 break
     return glyph_name
+
+
+def add_base_feature_variations(*, output_path: Path) -> None:
+    font: TTFont = TTFont(BASE_TTF)
+    addFeatureVariations(
+        font,
+        [([{"wght": (0.25, 1.0)}], {"A": "B"})],
+        featureTag="rlig",
+    )
+    font.save(output_path)
+    font.close()
+
+
+def add_donor_multiple_subst_feature_variations(*, output_path: Path) -> None:
+    font: TTFont = TTFont(DONOR_TTF)
+    gsub = font["GSUB"].table
+    gsub.FeatureVariations = None
+    gsub.Version = 0x00010000
+
+    multiple_subst = otTables.MultipleSubst()
+    multiple_subst.mapping = {"uni30AC": ["uni30AB", "uni30AD"]}
+    lookup = buildLookup([multiple_subst])
+    lookup_index: int = len(gsub.LookupList.Lookup)
+    gsub.LookupList.Lookup.append(lookup)
+    gsub.LookupList.LookupCount = len(gsub.LookupList.Lookup)
+    addFeatureVariationsRaw(
+        font,
+        gsub,
+        [({"wght": (0.2, 1.0)}, [lookup_index])],
+        featureTag="rlig",
+    )
+    font.save(output_path)
+    font.close()
 
 
 def source_outline_at(

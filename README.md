@@ -124,8 +124,7 @@ TTF output range가 Base range 안에 있고 source에 별도 metric/axis variat
 ## 현재 제약
 
 - output은 안전한 subset/merge를 위해 dehinted font로 생성됩니다.
-- TTF는 subset된 Base/Donor layout table을 merge합니다. Donor의 weight-dependent `GSUB FeatureVariations` 중 alternate feature가 `SingleSubst` lookup으로만 구성된 rule은 output에 재구성하며, `SingleSubst`를 감싼 Extension lookup도 지원합니다.
-- Base `GSUB FeatureVariations`는 아직 별도로 보존하지 않습니다. Donor alternate feature에 `SingleSubst` 이외의 lookup type이 하나라도 있으면 해당 feature는 output default weight에서 resolve한 static rule을 사용합니다.
+- TTF는 subset된 Base/Donor layout table을 merge합니다. Base와 Donor의 weight-dependent `GSUB FeatureVariations`는 output `wght` condition에 맞춰 재구성하며 `SingleSubst`, `MultipleSubst`, `AlternateSubst`, `LigatureSubst`, contextual lookup과 Extension lookup을 포함한 전체 alternate feature lookup graph를 보존합니다.
 - TTF의 static `GPOS` rule은 merge하지만 source의 weight-dependent `GPOS` variation 구조를 그대로 결합하지는 않습니다. direct TTF path는 output default weight의 static `GPOS`를 사용하고, Static master fallback은 master별 값을 `fontTools.varLib`으로 다시 interpolation합니다. `GPOS FeatureVariations`도 output에 재구성하지 않습니다.
 - OTF(CFF2)는 Base layout table을 유지하지만 새로 붙인 Donor glyph의 Donor `GSUB`/`GPOS` rule은 옮기지 않습니다. Donor의 contextual shaping이 필요한 script에는 현재 OTF path를 사용하지 않는 편이 안전합니다.
 - Static master fallback에서 큰 CJK group을 선택하면 여러 master의 모든 outline을 처리하므로 build에 시간이 걸리고 output 용량이 커질 수 있습니다.
