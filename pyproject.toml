@@ -2,6 +2,7 @@
 name = "custom-font-wizard-worker"
 version = "0.1.1"
 description = "fontTools worker for Custom Font Wizard"
+license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
     "fonttools>=4.63,<5",

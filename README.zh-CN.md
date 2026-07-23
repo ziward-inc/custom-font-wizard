@@ -138,3 +138,7 @@ uv run ruff check worker tests
 uv run ty check
 uv run python -m unittest discover -s tests -v
 ```
+
+## License
+
+Copyright 2026 Ziward, Inc. 基于 [Apache License, Version 2.0](LICENSE) 发布。
