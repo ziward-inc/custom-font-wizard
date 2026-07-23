@@ -115,7 +115,7 @@ class FontWorkerTests(unittest.TestCase):
                     self.assertEqual(font["name"].getDebugName(16), family_name)
                     font.close()
 
-    def test_build_uses_default_weight_donor_gsub_across_masters(self) -> None:
+    def test_build_preserves_donor_gsub_feature_variations_across_static_masters(self) -> None:
         with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
             output_path: Path = Path(temporary_directory) / "Kana.ttf"
             result: dict[str, object] = build_font(
@@ -123,7 +123,7 @@ class FontWorkerTests(unittest.TestCase):
                 donor_path=DONOR_TTF,
                 output_path=output_path,
                 family_name="Custom Font Wizard Kana Test",
-                weight_min=300,
+                weight_min=100,
                 weight_max=700,
                 selected_codepoints=[0x30AC],
             )
@@ -133,6 +133,20 @@ class FontWorkerTests(unittest.TestCase):
             self.assertIn("GSUB", font)
             self.assertEqual(set(font.getBestCmap() or {}), {0x30AC})
             font.close()
+
+            for weight, expected_glyph in (
+                (450, "uni30AC.varAlt01"),
+                (475, "uni30AC.varAlt01"),
+                (700, "uni30AC.varAlt02"),
+            ):
+                self.assertEqual(
+                    substituted_glyph_at(font_path=output_path, codepoint=0x30AC, weight=weight),
+                    expected_glyph,
+                )
+                self.assertEqual(
+                    substituted_glyph_at(font_path=output_path, codepoint=0x30AC, weight=weight),
+                    substituted_glyph_at(font_path=DONOR_TTF, codepoint=0x30AC, weight=weight),
+                )
 
     def test_build_preserves_ttf_variations_and_adds_weight_metadata(self) -> None:
         with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
@@ -190,6 +204,23 @@ class FontWorkerTests(unittest.TestCase):
                 outline_at(font_path=output_path, codepoint=0xAC02, weight=300),
                 outline_at(font_path=output_path, codepoint=0xAC02, weight=900),
             )
+            for weight, expected_glyph in (
+                (450, "uni30AC.varAlt01"),
+                (475, "uni30AC.varAlt01"),
+                (700, "uni30AC.varAlt02"),
+            ):
+                self.assertEqual(
+                    substituted_glyph_at(font_path=output_path, codepoint=0x30AC, weight=weight),
+                    expected_glyph,
+                )
+                self.assertEqual(
+                    substituted_glyph_at(font_path=output_path, codepoint=0x30AC, weight=weight),
+                    substituted_glyph_at(font_path=DONOR_TTF, codepoint=0x30AC, weight=weight),
+                )
+            self.assertNotEqual(
+                substituted_outline_at(font_path=output_path, codepoint=0x30AC, weight=450),
+                substituted_outline_at(font_path=output_path, codepoint=0x30AC, weight=475),
+            )
 
 
 def outline_at(*, font_path: Path, codepoint: int, weight: float) -> list[tuple[str, tuple[object, ...]]]:
@@ -202,6 +233,49 @@ def outline_at(*, font_path: Path, codepoint: int, weight: float) -> list[tuple[
     outline: list[tuple[str, tuple[object, ...]]] = list(pen.value)
     instance.close()
     return outline
+
+
+def substituted_glyph_at(*, font_path: Path, codepoint: int, weight: float) -> str:
+    font: TTFont = TTFont(font_path)
+    instance: TTFont = instantiateVariableFont(font, {"wght": weight}, inplace=True, static=True)
+    glyph_name: str = substituted_glyph(font=instance, codepoint=codepoint)
+    instance.close()
+    return glyph_name
+
+
+def substituted_outline_at(
+    *,
+    font_path: Path,
+    codepoint: int,
+    weight: float,
+) -> list[tuple[str, tuple[object, ...]]]:
+    font: TTFont = TTFont(font_path)
+    instance: TTFont = instantiateVariableFont(font, {"wght": weight}, inplace=True, static=True)
+    glyph_name: str = substituted_glyph(font=instance, codepoint=codepoint)
+    pen = RecordingPen()
+    instance.getGlyphSet()[glyph_name].draw(pen)
+    outline: list[tuple[str, tuple[object, ...]]] = list(pen.value)
+    instance.close()
+    return outline
+
+
+def substituted_glyph(*, font: TTFont, codepoint: int) -> str:
+    glyph_name: str = dict(font.getBestCmap() or {})[codepoint]
+    gsub = font["GSUB"].table
+    feature = next(
+        feature_record.Feature
+        for feature_record in gsub.FeatureList.FeatureRecord
+        if feature_record.FeatureTag == "rlig"
+    )
+    for lookup_index in feature.LookupListIndex:
+        lookup = gsub.LookupList.Lookup[lookup_index]
+        for subtable in lookup.SubTable:
+            single_subst = subtable.ExtSubTable if lookup.LookupType == 7 else subtable
+            target: str | None = single_subst.mapping.get(glyph_name)
+            if target is not None:
+                glyph_name = target
+                break
+    return glyph_name
 
 
 def source_outline_at(
