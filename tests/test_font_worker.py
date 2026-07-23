@@ -4,21 +4,42 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
-from fontTools.otlLib.builder import buildLookup
+from fontTools.designspaceLib import AxisDescriptor, DesignSpaceDocument, SourceDescriptor
+from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+from fontTools.fontBuilder import FontBuilder
+from fontTools.otlLib.builder import buildLookup, buildSinglePos, buildValue
 from fontTools.pens.recordingPen import RecordingPen
-from fontTools.ttLib import TTFont
+from fontTools.pens.t2CharStringPen import T2CharStringPen
+from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.scaleUpem import scale_upem
 from fontTools.ttLib.tables import otTables
+from fontTools.varLib import build as build_variable_font
+from fontTools.varLib.builder import buildVarDevTable
 from fontTools.varLib.featureVars import addFeatureVariations, addFeatureVariationsRaw
 from fontTools.varLib.instancer import instantiateVariableFont
+from fontTools.varLib.varStore import OnlineVarStoreBuilder
 
 from worker.font_engine import BuildStep, BuildStepStatus, analyze_fonts, build_font, subset_font
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 BASE_TTF: Path = PROJECT_ROOT / "SUITE-Variable-ttf/SUITE-Variable.ttf"
 DONOR_TTF: Path = PROJECT_ROOT / "PretendardVariable.ttf"
+
+
+class TestGdef(Protocol):
+    Version: int
+    GlyphClassDef: object | None
+    AttachList: object | None
+    LigCaretList: object | None
+    MarkAttachClassDef: object | None
+    MarkGlyphSetsDef: object | None
+    VarStore: object
+
+
+class ObjectFactory(Protocol):
+    def __call__(self) -> object: ...
 
 
 class FontWorkerTests(unittest.TestCase):
@@ -205,6 +226,82 @@ class FontWorkerTests(unittest.TestCase):
                 ("uni30AB", "uni30AD"),
             )
 
+    def test_build_preserves_gpos_variation_and_feature_variations(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
+            temporary_root: Path = Path(temporary_directory)
+            base_path: Path = temporary_root / "BaseGposVariations.ttf"
+            add_gpos_variations(output_path=base_path)
+
+            for weight_min, weight_max, samples in (
+                (300, 900, ((300, 300), (450, 450), (600, 600), (900, 900))),
+                (100, 700, ((100, 300), (400, 400), (600, 600), (700, 700))),
+            ):
+                with self.subTest(weight_min=weight_min, weight_max=weight_max):
+                    output_path: Path = temporary_root / f"BaseGposVariations-{weight_min}-{weight_max}.ttf"
+                    build_font(
+                        base_path=base_path,
+                        donor_path=DONOR_TTF,
+                        output_path=output_path,
+                        family_name="Custom Font Wizard GPOS Variations Test",
+                        weight_min=weight_min,
+                        weight_max=weight_max,
+                        selected_codepoints=[0x0041],
+                    )
+
+                    for output_weight, source_weight in samples:
+                        self.assertEqual(
+                            positioning_at(font_path=output_path, codepoint=0x0041, weight=output_weight),
+                            positioning_at(font_path=base_path, codepoint=0x0041, weight=source_weight),
+                        )
+
+    def test_build_merges_otf_donor_layout_and_position_variation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
+            temporary_root: Path = Path(temporary_directory)
+            base_path: Path = temporary_root / "BaseVariable.otf"
+            donor_path: Path = temporary_root / "DonorVariable.otf"
+            output_path: Path = temporary_root / "MergedVariable.otf"
+            build_test_variable_otf(
+                output_path=base_path,
+                temporary_root=temporary_root / "base-masters",
+                family_name="Base CFF2 Test",
+                visible_b=False,
+                include_layout=False,
+            )
+            build_test_variable_otf(
+                output_path=donor_path,
+                temporary_root=temporary_root / "donor-masters",
+                family_name="Donor CFF2 Test",
+                visible_b=True,
+                include_layout=True,
+            )
+
+            result: dict[str, object] = build_font(
+                base_path=base_path,
+                donor_path=donor_path,
+                output_path=output_path,
+                family_name="Custom Font Wizard CFF2 Layout Test",
+                weight_min=300,
+                weight_max=900,
+                selected_codepoints=[0x0042],
+            )
+
+            self.assertEqual(result["donor_repaired"], 1)
+            output_font: TTFont = TTFont(output_path)
+            self.assertIn("CFF2", output_font)
+            mapped_glyph: str = dict(output_font.getBestCmap() or {})[0x0042]
+            output_font.close()
+            substituted_glyph_name: str = substituted_glyph_at(
+                font_path=output_path,
+                codepoint=0x0042,
+                weight=600,
+            )
+            self.assertNotEqual(substituted_glyph_name, mapped_glyph)
+            for weight in (300, 600, 900):
+                self.assertEqual(
+                    positioning_at(font_path=output_path, codepoint=0x0042, weight=weight),
+                    positioning_at(font_path=donor_path, codepoint=0x0042, weight=weight),
+                )
+
     def test_build_preserves_ttf_variations_and_adds_weight_metadata(self) -> None:
         with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
             output_path: Path = Path(temporary_directory) / "Direct.ttf"
@@ -321,6 +418,31 @@ def multiple_substitution_at(*, font_path: Path, codepoint: int, weight: float) 
     return substitutions
 
 
+def positioning_at(*, font_path: Path, codepoint: int, weight: float) -> int:
+    font: TTFont = TTFont(font_path)
+    instance: TTFont = instantiateVariableFont(font, {"wght": weight}, inplace=True, static=True)
+    glyph_name: str = dict(instance.getBestCmap() or {})[codepoint]
+    gpos = instance["GPOS"].table
+    value: int = 0
+    for feature_record in gpos.FeatureList.FeatureRecord:
+        if feature_record.FeatureTag != "zzzz":
+            continue
+        for lookup_index in feature_record.Feature.LookupListIndex:
+            lookup = gpos.LookupList.Lookup[lookup_index]
+            for subtable in lookup.SubTable:
+                single_pos = subtable.ExtSubTable if lookup.LookupType == 9 else subtable
+                if glyph_name not in single_pos.Coverage.glyphs:
+                    continue
+                position = (
+                    single_pos.Value
+                    if single_pos.Format == 1
+                    else single_pos.Value[single_pos.Coverage.glyphs.index(glyph_name)]
+                )
+                value += int(getattr(position, "XAdvance", 0))
+    instance.close()
+    return value
+
+
 def substituted_outline_at(
     *,
     font_path: Path,
@@ -390,6 +512,175 @@ def add_donor_multiple_subst_feature_variations(*, output_path: Path) -> None:
         [({"wght": (0.2, 1.0)}, [lookup_index])],
         featureTag="rlig",
     )
+    font.save(output_path)
+    font.close()
+
+
+def add_gpos_variations(*, output_path: Path) -> None:
+    font: TTFont = TTFont(BASE_TTF)
+    addOpenTypeFeaturesFromString(font, "feature zzzz { pos A -20; } zzzz;")
+    gpos = font["GPOS"].table
+
+    store_builder = OnlineVarStoreBuilder(["wght"])
+    store_builder.setSupports([{"wght": (0.0, 1.0, 1.0)}])
+    baseline_var_index: int = store_builder.storeDeltas([120])
+    alternate_var_index: int = store_builder.storeDeltas([60])
+    if "GDEF" not in font:
+        gdef_table = font["GDEF"] = newTable("GDEF")
+        gdef_class: object = getattr(otTables, "GDEF", None)
+        if not callable(gdef_class):
+            raise RuntimeError("fontTools GDEF class를 찾을 수 없습니다")
+        gdef_factory: ObjectFactory = cast("ObjectFactory", gdef_class)
+        gdef_object: object = gdef_factory()
+        gdef: TestGdef = cast("TestGdef", gdef_object)
+        setattr(gdef_table, "table", gdef)
+        gdef.GlyphClassDef = None
+        gdef.AttachList = None
+        gdef.LigCaretList = None
+        gdef.MarkAttachClassDef = None
+        gdef.MarkGlyphSetsDef = None
+    else:
+        gdef = cast("TestGdef", font["GDEF"].table)
+    gdef.Version = 0x00010003
+    gdef.VarStore = store_builder.finish()
+
+    baseline_feature = next(
+        feature_record.Feature
+        for feature_record in gpos.FeatureList.FeatureRecord
+        if feature_record.FeatureTag == "zzzz"
+    )
+    baseline_lookup = gpos.LookupList.Lookup[baseline_feature.LookupListIndex[0]]
+    baseline_subtable = baseline_lookup.SubTable[0]
+    baseline_value = baseline_subtable.Value if baseline_subtable.Format == 1 else baseline_subtable.Value[0]
+    baseline_value.XAdvDevice = buildVarDevTable(baseline_var_index)
+    baseline_subtable.ValueFormat |= 0x0040
+
+    alternate_value = buildValue(
+        {
+            "XAdvance": 200,
+            "XAdvDevice": buildVarDevTable(alternate_var_index),
+        }
+    )
+    alternate_subtables = buildSinglePos({"A": alternate_value}, font.getReverseGlyphMap())
+    alternate_lookup = buildLookup(alternate_subtables)
+    alternate_lookup_index: int = len(gpos.LookupList.Lookup)
+    gpos.LookupList.Lookup.append(alternate_lookup)
+    gpos.LookupList.LookupCount = len(gpos.LookupList.Lookup)
+    addFeatureVariationsRaw(
+        font,
+        gpos,
+        [({"wght": (0.25, 1.0)}, [alternate_lookup_index])],
+        featureTag="zzzz",
+    )
+    font.save(output_path)
+    font.close()
+
+
+def build_test_variable_otf(
+    *,
+    output_path: Path,
+    temporary_root: Path,
+    family_name: str,
+    visible_b: bool,
+    include_layout: bool,
+) -> None:
+    temporary_root.mkdir()
+    master_paths: list[tuple[float, Path]] = []
+    for weight, advance_adjustment in ((300.0, -20), (900.0, -80)):
+        master_path: Path = temporary_root / f"master-{weight:g}.otf"
+        build_test_static_otf(
+            output_path=master_path,
+            family_name=family_name,
+            visible_b=visible_b,
+            include_layout=include_layout,
+            advance_adjustment=advance_adjustment,
+            outline_shift=int((weight - 300) / 6),
+        )
+        master_paths.append((weight, master_path))
+
+    designspace = DesignSpaceDocument()
+    axis = AxisDescriptor()
+    axis.name = "Weight"
+    axis.tag = "wght"
+    axis.minimum = 300
+    axis.default = 300
+    axis.maximum = 900
+    designspace.addAxis(axis)
+    for index, (weight, master_path) in enumerate(master_paths):
+        source = SourceDescriptor()
+        source.name = f"master-{index}"
+        source.path = str(master_path)
+        source.location = {"Weight": weight}
+        if weight == 300:
+            source.copyInfo = True
+            source.copyLib = True
+            source.copyFeatures = True
+        designspace.addSource(source)
+    variable_font_result: tuple[TTFont, object, list[TTFont]] = build_variable_font(designspace)
+    variable_font: TTFont = variable_font_result[0]
+    variable_font.save(output_path)
+    variable_font.close()
+
+
+def build_test_static_otf(
+    *,
+    output_path: Path,
+    family_name: str,
+    visible_b: bool,
+    include_layout: bool,
+    advance_adjustment: int,
+    outline_shift: int,
+) -> None:
+    glyph_order: list[str] = [".notdef", "A", "B", "B.alt"]
+    char_strings: dict[str, object] = {}
+    for glyph_name in glyph_order:
+        pen = T2CharStringPen(width=600, glyphSet=None, CFF2=False)
+        if glyph_name == "A" or (visible_b and glyph_name in {"B", "B.alt"}):
+            inset: int = 50 if glyph_name == "B.alt" else 0
+            pen.moveTo((100 + inset, 0))
+            pen.lineTo((300, 700 + outline_shift))
+            pen.lineTo((500 - inset, 0))
+            pen.closePath()
+        char_strings[glyph_name] = pen.getCharString()
+
+    builder = FontBuilder(1000, isTTF=False)
+    builder.setupGlyphOrder(glyph_order)
+    builder.setupCharacterMap({0x0041: "A", 0x0042: "B"})
+    builder.setupCFF(
+        f"{family_name.replace(' ', '')}-Regular",
+        {"FullName": family_name, "FamilyName": family_name, "Weight": "Regular"},
+        char_strings,
+        {},
+    )
+    metrics: dict[str, tuple[int, int]] = {glyph_name: (600, 0) for glyph_name in glyph_order}
+    builder.setupHorizontalMetrics(metrics)
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupNameTable(
+        {
+            "familyName": family_name,
+            "styleName": "Regular",
+            "uniqueFontIdentifier": f"{family_name};Regular",
+            "fullName": f"{family_name} Regular",
+            "psName": f"{family_name.replace(' ', '')}-Regular",
+            "version": "Version 1.0",
+            "typographicFamily": family_name,
+            "typographicSubfamily": "Regular",
+        }
+    )
+    builder.setupOS2(
+        sTypoAscender=800,
+        sTypoDescender=-200,
+        usWinAscent=800,
+        usWinDescent=200,
+        usWeightClass=400,
+    )
+    builder.setupPost()
+    font: TTFont = builder.font
+    if include_layout:
+        feature_text: str = (
+            f"feature rlig {{ sub B by B.alt; }} rlig; feature zzzz {{ pos B {advance_adjustment}; }} zzzz;"
+        )
+        addOpenTypeFeaturesFromString(font, feature_text)
     font.save(output_path)
     font.close()
 

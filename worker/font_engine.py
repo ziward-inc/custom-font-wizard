@@ -4,7 +4,6 @@ import copy
 import math
 import re
 import tempfile
-from collections.abc import Iterable
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import pairwise
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 
 from fontTools.designspaceLib import AxisDescriptor, DesignSpaceDocument, SourceDescriptor
+from fontTools.fontBuilder import FontBuilder
 from fontTools.merge import Merger
 from fontTools.merge.cmap import computeMegaGlyphOrder
 from fontTools.merge.options import Options as MergeOptions
@@ -32,9 +32,10 @@ from fontTools.varLib.featureVars import (
     buildFeatureVariationRecord,
     buildFeatureVariations,
 )
-from fontTools.varLib.instancer import instantiateVariableFont
+from fontTools.varLib.instancer import downgradeCFF2ToCFF, instantiateVariableFont
 
 FontFlavor = Literal["ttf", "otf"]
+LayoutTableTag = Literal["GSUB", "GPOS"]
 GlyphStatus = Literal["visible", "blank", "missing"]
 BuildStep = Literal[
     "validate_inputs",
@@ -50,44 +51,45 @@ F2DOT14_SCALE: int = 1 << 14
 
 
 @dataclass(frozen=True)
-class GsubFeatureVariationRecord:
+class LayoutFeatureVariationRecord:
     minimum: int
     maximum: int
     feature_tags: frozenset[str]
 
 
 @dataclass(frozen=True)
-class GsubFeatureVariationSource:
+class LayoutFeatureVariationSource:
     font_data: bytes
-    records: tuple[GsubFeatureVariationRecord, ...]
+    records: tuple[LayoutFeatureVariationRecord, ...]
 
 
 @dataclass(frozen=True)
-class GsubFeatureVariationState:
+class LayoutFeatureVariationState:
     base_record_index: int | None
     donor_record_index: int | None
 
 
 @dataclass(frozen=True)
-class GsubFeatureVariationUnitSegment:
+class LayoutFeatureVariationUnitSegment:
     minimum: int
     maximum: int
-    state: GsubFeatureVariationState
+    state: LayoutFeatureVariationState
 
 
 @dataclass(frozen=True)
-class GsubFeatureVariationSegment:
+class LayoutFeatureVariationSegment:
     minimum: float
     maximum: float
     source_weight: float
 
 
 @dataclass(frozen=True)
-class GsubFeatureVariationPlan:
-    base_source: GsubFeatureVariationSource
-    donor_source: GsubFeatureVariationSource
+class LayoutFeatureVariationPlan:
+    table_tag: LayoutTableTag
+    base_source: LayoutFeatureVariationSource
+    donor_source: LayoutFeatureVariationSource
     feature_tags: frozenset[str]
-    segments: tuple[GsubFeatureVariationSegment, ...]
+    segments: tuple[LayoutFeatureVariationSegment, ...]
 
 
 class BuildProgress(Protocol):
@@ -95,6 +97,7 @@ class BuildProgress(Protocol):
 
 
 class OtFeature(Protocol):
+    FeatureParams: object
     LookupListIndex: list[int]
     LookupCount: int
 
@@ -393,112 +396,114 @@ def build_font(
             status="running",
             message=f"Static master {len(sample_weights)}개를 생성합니다",
         )
-        base_gsub_data: bytes | None = None
-        donor_gsub_data: bytes | None = None
-        gsub_feature_variation_plan: GsubFeatureVariationPlan | None = None
-        base_variation_order: list[str] = []
-        donor_variation_order: list[str] = []
-        base_variation_glyphs: set[str] = set()
-        donor_variation_glyphs: set[str] = set()
-        fallback_donor_name_map: dict[str, str] | None = None
-        if flavor == "ttf":
-            base_variation_font: TTFont = prepare_variable_ttf_source(
-                path=base_path,
-                codepoints=base_codepoints,
-                minimum=effective_min,
-                default=output_default,
-                maximum=effective_max,
-            )
-            donor_variation_font: TTFont = prepare_variable_ttf_source(
-                path=donor_path,
-                codepoints=donor_codepoints,
-                minimum=effective_min,
-                default=output_default,
-                maximum=effective_max,
-            )
-            gsub_feature_variation_plan = build_gsub_feature_variation_plan(
-                base_font=base_variation_font,
-                donor_font=donor_variation_font,
-                source_axis=(effective_min, output_default, effective_max),
-                output_axis=(weight_min, output_default, weight_max),
-            )
-            base_variation_order = list(base_variation_font.getGlyphOrder())
-            donor_variation_order = list(donor_variation_font.getGlyphOrder())
-            base_variation_glyphs = set(base_variation_order)
-            donor_variation_glyphs = set(donor_variation_order)
-            base_gsub_data = detach_gsub_feature_variations(font=base_variation_font)
-            donor_gsub_data = detach_gsub_feature_variations(font=donor_variation_font)
-            base_variation_font.close()
-            donor_variation_font.close()
+        gsub_feature_variation_plan: LayoutFeatureVariationPlan | None = None
+        gpos_feature_variation_plan: LayoutFeatureVariationPlan | None = None
+        base_variation_font: TTFont = prepare_variable_source(
+            path=base_path,
+            codepoints=base_codepoints,
+            minimum=effective_min,
+            default=output_default,
+            maximum=effective_max,
+        )
+        donor_variation_font: TTFont = prepare_variable_source(
+            path=donor_path,
+            codepoints=donor_codepoints,
+            minimum=effective_min,
+            default=output_default,
+            maximum=effective_max,
+        )
+        retain_feature_variation_lookups(font=base_variation_font, table_tag="GPOS")
+        retain_feature_variation_lookups(font=donor_variation_font, table_tag="GPOS")
+        gsub_feature_variation_plan = build_gsub_feature_variation_plan(
+            base_font=base_variation_font,
+            donor_font=donor_variation_font,
+            source_axis=(effective_min, output_default, effective_max),
+            output_axis=(weight_min, output_default, weight_max),
+        )
+        gpos_feature_variation_plan = build_gpos_feature_variation_plan(
+            base_font=base_variation_font,
+            donor_font=donor_variation_font,
+            source_axis=(effective_min, output_default, effective_max),
+            output_axis=(weight_min, output_default, weight_max),
+        )
+        base_variation_order: list[str] = list(base_variation_font.getGlyphOrder())
+        donor_variation_order: list[str] = list(donor_variation_font.getGlyphOrder())
+        detach_feature_variations(font=base_variation_font, table_tag="GSUB")
+        detach_feature_variations(font=donor_variation_font, table_tag="GSUB")
+        detach_feature_variations(font=base_variation_font, table_tag="GPOS")
+        detach_feature_variations(font=donor_variation_font, table_tag="GPOS")
+        base_baseline_data: bytes = serialize_font(font=base_variation_font)
+        donor_baseline_data: bytes = serialize_font(font=donor_variation_font)
+        base_variation_font.close()
+        donor_variation_font.close()
         with tempfile.TemporaryDirectory(prefix="custom-font-wizard-") as temporary_directory:
             temporary_root: Path = Path(temporary_directory)
             master_paths: list[tuple[float, Path]] = []
-            cff_target_names: dict[int, str] | None = None
+            fallback_donor_name_map: dict[str, str] | None = None
+            fallback_base_master_order: list[str] | None = None
+            fallback_donor_master_order: list[str] | None = None
 
             for index, output_weight in enumerate(sample_weights):
                 source_weight: float = clamp(value=output_weight, minimum=base_axis[0], maximum=base_axis[2])
-                base_master: TTFont = static_instance(path=base_path, weight=source_weight, flavor=flavor)
-                donor_master: TTFont = static_instance(path=donor_path, weight=source_weight, flavor=flavor)
+                base_master: TTFont = static_instance_from_data(
+                    font_data=base_baseline_data,
+                    weight=source_weight,
+                    flavor=flavor,
+                )
+                donor_master: TTFont = static_instance_from_data(
+                    font_data=donor_baseline_data,
+                    weight=source_weight,
+                    flavor=flavor,
+                )
                 scale_upem(donor_master, base_upem)
 
                 master_path: Path = temporary_root / f"master-{index:02d}.{flavor}"
+                current_base_order: list[str] = list(base_master.getGlyphOrder())
+                current_donor_order: list[str] = list(donor_master.getGlyphOrder())
                 if flavor == "ttf":
-                    subset_font(
-                        font=base_master,
-                        codepoints=base_codepoints,
-                        glyphs=base_variation_glyphs,
-                    )
-                    subset_font(
-                        font=donor_master,
-                        codepoints=donor_codepoints,
-                        glyphs=donor_variation_glyphs,
-                    )
-                    if base_master.getGlyphOrder() != base_variation_order:
+                    if current_base_order != base_variation_order:
                         raise FontBuildError("Static master의 Base glyph order가 variation source와 다릅니다")
-                    if donor_master.getGlyphOrder() != donor_variation_order:
+                    if current_donor_order != donor_variation_order:
                         raise FontBuildError("Static master의 Donor glyph order가 variation source와 다릅니다")
-                    replace_table_data(font=base_master, table_tag="GSUB", table_data=base_gsub_data)
-                    replace_table_data(font=donor_master, table_tag="GSUB", table_data=donor_gsub_data)
-                    base_order: list[str] = list(base_master.getGlyphOrder())
-                    donor_order: list[str] = list(donor_master.getGlyphOrder())
-                    merged_orders: list[list[str]] = [base_order.copy(), donor_order.copy()]
-                    order_merger = Merger()
-                    computeMegaGlyphOrder(order_merger, merged_orders)
-                    expected_glyph_order: list[str] = cast(
-                        "list[str]",
-                        getattr(order_merger, "glyphOrder"),
-                    )
-                    donor_name_map: dict[str, str] = dict(zip(donor_order, merged_orders[1], strict=True))
-                    if fallback_donor_name_map is None:
-                        fallback_donor_name_map = donor_name_map
-                    elif fallback_donor_name_map != donor_name_map:
-                        raise FontBuildError(
-                            "Static master GSUB FeatureVariations의 glyph name mapping이 변경되었습니다"
-                        )
-                    base_path_for_merge: Path = temporary_root / f"base-{index:02d}.ttf"
-                    donor_path_for_merge: Path = temporary_root / f"donor-{index:02d}.ttf"
-                    base_master.save(base_path_for_merge, reorderTables=True)
-                    donor_master.save(donor_path_for_merge, reorderTables=True)
-                    merged_master: TTFont = Merger().merge([str(base_path_for_merge), str(donor_path_for_merge)])
-                    if merged_master.getGlyphOrder() != expected_glyph_order:
-                        raise FontBuildError("Static master merge 과정에서 glyph order가 변경되었습니다")
                 else:
-                    subset_font(font=base_master, codepoints=base_codepoints)
-                    if cff_target_names is None:
-                        cff_target_names = allocate_cff_names(font=base_master, codepoints=donor_codepoints)
-                    append_cff_glyphs(
-                        base_font=base_master,
-                        donor_font=donor_master,
-                        codepoints=donor_codepoints,
-                        target_names=cff_target_names,
-                    )
-                    merged_master = base_master
+                    if fallback_base_master_order is None:
+                        fallback_base_master_order = current_base_order
+                        fallback_donor_master_order = current_donor_order
+                    elif (
+                        current_base_order != fallback_base_master_order
+                        or current_donor_order != fallback_donor_master_order
+                    ):
+                        raise FontBuildError("Static OTF master의 glyph order가 weight별로 다릅니다")
+                if flavor == "otf":
+                    normalize_cff_master(font=base_master)
+                    normalize_cff_master(font=donor_master)
+
+                base_order: list[str] = list(base_master.getGlyphOrder())
+                donor_order: list[str] = list(donor_master.getGlyphOrder())
+                merged_orders: list[list[str]] = [base_order.copy(), donor_order.copy()]
+                order_merger = Merger()
+                computeMegaGlyphOrder(order_merger, merged_orders)
+                expected_glyph_order: list[str] = cast(
+                    "list[str]",
+                    getattr(order_merger, "glyphOrder"),
+                )
+                donor_name_map: dict[str, str] = dict(zip(donor_order, merged_orders[1], strict=True))
+                if fallback_donor_name_map is None:
+                    fallback_donor_name_map = donor_name_map
+                elif fallback_donor_name_map != donor_name_map:
+                    raise FontBuildError("Static master의 Donor glyph name mapping이 변경되었습니다")
+                base_path_for_merge: Path = temporary_root / f"base-{index:02d}.{flavor}"
+                donor_path_for_merge: Path = temporary_root / f"donor-{index:02d}.{flavor}"
+                base_master.save(base_path_for_merge, reorderTables=True)
+                donor_master.save(donor_path_for_merge, reorderTables=True)
+                merged_master: TTFont = Merger().merge([str(base_path_for_merge), str(donor_path_for_merge)])
+                if merged_master.getGlyphOrder() != expected_glyph_order:
+                    raise FontBuildError("Static master merge 과정에서 glyph order가 변경되었습니다")
 
                 merged_master.save(master_path, reorderTables=True)
                 merged_master.close()
                 donor_master.close()
-                if flavor == "ttf":
-                    base_master.close()
+                base_master.close()
                 master_paths.append((output_weight, master_path))
                 report_progress(
                     progress=progress,
@@ -533,6 +538,12 @@ def build_font(
                 add_gsub_feature_variations(
                     font=variable_font,
                     plan=gsub_feature_variation_plan,
+                    base_upem=base_upem,
+                )
+            if gpos_feature_variation_plan is not None:
+                add_gpos_feature_variations(
+                    font=variable_font,
+                    plan=gpos_feature_variation_plan,
                     base_upem=base_upem,
                 )
             report_progress(
@@ -715,6 +726,52 @@ def static_instance(*, path: Path, weight: float, flavor: FontFlavor) -> TTFont:
     return instantiated
 
 
+def static_instance_from_data(*, font_data: bytes, weight: float, flavor: FontFlavor) -> TTFont:
+    font: TTFont = TTFont(BytesIO(font_data), recalcTimestamp=False)
+    if flavor == "otf" and cff2_has_no_var_store(font=font):
+        font = downgradeCFF2ToCFF(font)
+    downgrade_cff2: bool = flavor == "otf" and "CFF2" in font
+    instantiated: TTFont = instantiateVariableFont(
+        font,
+        {"wght": weight},
+        inplace=True,
+        static=True,
+        downgradeCFF2=downgrade_cff2,
+    )
+    return instantiated
+
+
+def cff2_has_no_var_store(*, font: TTFont) -> bool:
+    if "CFF2" not in font:
+        return False
+    top_dict = font["CFF2"].cff.topDictIndex[0]
+    return getattr(top_dict, "VarStore", None) is None
+
+
+def normalize_cff_master(*, font: TTFont) -> None:
+    if "CFF " not in font:
+        raise FontBuildError("Name-keyed CFF로 normalize할 CFF table이 없습니다")
+    glyph_order: list[str] = list(font.getGlyphOrder())
+    glyph_set = font.getGlyphSet()
+    char_strings: dict[str, object] = {}
+    for glyph_name in glyph_order:
+        advance_width: int = int(font["hmtx"].metrics[glyph_name][0])
+        pen = T2CharStringPen(width=advance_width, glyphSet=None, CFF2=False)
+        glyph_set[glyph_name].draw(pen)
+        char_strings[glyph_name] = pen.getCharString()
+
+    family: str = family_name(font=font)
+    postscript_name: str = postscript_fragment(value=family) or "CustomFont"
+    del font["CFF "]
+    builder = FontBuilder(font=font)
+    builder.setupCFF(
+        psName=postscript_name,
+        fontInfo={"FullName": family, "FamilyName": family, "Weight": "Regular"},
+        charStringsDict=char_strings,
+        privateDict={},
+    )
+
+
 def replace_table_data(*, font: TTFont, table_tag: str, table_data: bytes | None) -> None:
     if table_data is None:
         if table_tag in font:
@@ -756,19 +813,54 @@ def build_gsub_feature_variation_plan(
     donor_font: TTFont,
     source_axis: tuple[float, float, float],
     output_axis: tuple[float, float, float],
-) -> GsubFeatureVariationPlan | None:
+) -> LayoutFeatureVariationPlan | None:
+    return build_feature_variation_plan(
+        base_font=base_font,
+        donor_font=donor_font,
+        source_axis=source_axis,
+        output_axis=output_axis,
+        table_tag="GSUB",
+    )
+
+
+def build_gpos_feature_variation_plan(
+    *,
+    base_font: TTFont,
+    donor_font: TTFont,
+    source_axis: tuple[float, float, float],
+    output_axis: tuple[float, float, float],
+) -> LayoutFeatureVariationPlan | None:
+    return build_feature_variation_plan(
+        base_font=base_font,
+        donor_font=donor_font,
+        source_axis=source_axis,
+        output_axis=output_axis,
+        table_tag="GPOS",
+    )
+
+
+def build_feature_variation_plan(
+    *,
+    base_font: TTFont,
+    donor_font: TTFont,
+    source_axis: tuple[float, float, float],
+    output_axis: tuple[float, float, float],
+    table_tag: LayoutTableTag,
+) -> LayoutFeatureVariationPlan | None:
     source_minimum, source_default, source_maximum = source_axis
     domain_minimum: int = -F2DOT14_SCALE if source_minimum < source_default else 0
     domain_maximum: int = F2DOT14_SCALE if source_default < source_maximum else 0
-    base_source: GsubFeatureVariationSource = gsub_feature_variation_source(
+    base_source: LayoutFeatureVariationSource = gsub_feature_variation_source(
         font=base_font,
         domain_minimum=domain_minimum,
         domain_maximum=domain_maximum,
+        table_tag=table_tag,
     )
-    donor_source: GsubFeatureVariationSource = gsub_feature_variation_source(
+    donor_source: LayoutFeatureVariationSource = gsub_feature_variation_source(
         font=donor_font,
         domain_minimum=domain_minimum,
         domain_maximum=domain_maximum,
+        table_tag=table_tag,
     )
     feature_tags: frozenset[str] = frozenset(
         feature_tag
@@ -786,33 +878,33 @@ def build_gsub_feature_variation_plan(
             boundaries.add(record.maximum + 1)
 
     ordered_boundaries: list[int] = sorted(boundaries)
-    unit_segments: list[GsubFeatureVariationUnitSegment] = []
+    unit_segments: list[LayoutFeatureVariationUnitSegment] = []
     for minimum, next_minimum in pairwise(ordered_boundaries):
         maximum: int = next_minimum - 1
         sample: int = (minimum + maximum) // 2
-        state = GsubFeatureVariationState(
+        state = LayoutFeatureVariationState(
             base_record_index=matching_feature_variation_record(records=base_source.records, value=sample),
             donor_record_index=matching_feature_variation_record(records=donor_source.records, value=sample),
         )
         if state.base_record_index is None and state.donor_record_index is None:
             continue
         if unit_segments and unit_segments[-1].maximum + 1 == minimum and unit_segments[-1].state == state:
-            previous: GsubFeatureVariationUnitSegment = unit_segments[-1]
-            unit_segments[-1] = GsubFeatureVariationUnitSegment(
+            previous: LayoutFeatureVariationUnitSegment = unit_segments[-1]
+            unit_segments[-1] = LayoutFeatureVariationUnitSegment(
                 minimum=previous.minimum,
                 maximum=maximum,
                 state=state,
             )
         else:
             unit_segments.append(
-                GsubFeatureVariationUnitSegment(
+                LayoutFeatureVariationUnitSegment(
                     minimum=minimum,
                     maximum=maximum,
                     state=state,
                 )
             )
 
-    segments: list[GsubFeatureVariationSegment] = []
+    segments: list[LayoutFeatureVariationSegment] = []
     for unit_segment in unit_segments:
         source_interval: tuple[float, float] = (
             unit_segment.minimum / F2DOT14_SCALE,
@@ -826,13 +918,14 @@ def build_gsub_feature_variation_plan(
         sample_normalized: float = ((unit_segment.minimum + unit_segment.maximum) / 2) / F2DOT14_SCALE
         source_weight: float = denormalize_weight(value=sample_normalized, axis=source_axis)
         segments.append(
-            GsubFeatureVariationSegment(
+            LayoutFeatureVariationSegment(
                 minimum=output_interval[0],
                 maximum=output_interval[1],
                 source_weight=source_weight,
             )
         )
-    return GsubFeatureVariationPlan(
+    return LayoutFeatureVariationPlan(
+        table_tag=table_tag,
         base_source=base_source,
         donor_source=donor_source,
         feature_tags=feature_tags,
@@ -845,11 +938,12 @@ def gsub_feature_variation_source(
     font: TTFont,
     domain_minimum: int,
     domain_maximum: int,
-) -> GsubFeatureVariationSource:
-    records: list[GsubFeatureVariationRecord] = []
-    if "GSUB" in font:
-        gsub = font["GSUB"].table
-        feature_variations = getattr(gsub, "FeatureVariations", None)
+    table_tag: LayoutTableTag,
+) -> LayoutFeatureVariationSource:
+    records: list[LayoutFeatureVariationRecord] = []
+    if table_tag in font:
+        layout_table = font[table_tag].table
+        feature_variations = getattr(layout_table, "FeatureVariations", None)
         if feature_variations is not None:
             axis_tags: list[str] = [axis.axisTag for axis in font["fvar"].axes]
             for variation_record in feature_variations.FeatureVariationRecord:
@@ -858,23 +952,23 @@ def gsub_feature_variation_source(
                     axis_tags=axis_tags,
                 )
                 if interval is None:
-                    raise FontBuildError("GSUB FeatureVariations에 지원하지 않는 condition이 있습니다")
+                    raise FontBuildError(f"{table_tag} FeatureVariations에 지원하지 않는 condition이 있습니다")
                 minimum: int = max(domain_minimum, normalized_to_f2dot14(value=interval[0]))
                 maximum: int = min(domain_maximum, normalized_to_f2dot14(value=interval[1]))
                 if minimum > maximum:
                     continue
                 feature_tags: frozenset[str] = frozenset(
-                    gsub.FeatureList.FeatureRecord[substitution_record.FeatureIndex].FeatureTag
+                    layout_table.FeatureList.FeatureRecord[substitution_record.FeatureIndex].FeatureTag
                     for substitution_record in variation_record.FeatureTableSubstitution.SubstitutionRecord
                 )
                 records.append(
-                    GsubFeatureVariationRecord(
+                    LayoutFeatureVariationRecord(
                         minimum=minimum,
                         maximum=maximum,
                         feature_tags=feature_tags,
                     )
                 )
-    return GsubFeatureVariationSource(
+    return LayoutFeatureVariationSource(
         font_data=serialize_font(font=font),
         records=tuple(records),
     )
@@ -882,7 +976,7 @@ def gsub_feature_variation_source(
 
 def matching_feature_variation_record(
     *,
-    records: tuple[GsubFeatureVariationRecord, ...],
+    records: tuple[LayoutFeatureVariationRecord, ...],
     value: int,
 ) -> int | None:
     for index, record in enumerate(records):
@@ -941,30 +1035,113 @@ def serialize_font(*, font: TTFont) -> bytes:
     return stream.getvalue()
 
 
+def serialize_positioning_source(*, font: TTFont) -> bytes:
+    source_data: bytes = serialize_font(font=font)
+    positioning_font: TTFont = TTFont(BytesIO(source_data), recalcTimestamp=False)
+    for table_tag in ("gvar", "HVAR", "VVAR", "MVAR", "cvar"):
+        if table_tag in positioning_font:
+            del positioning_font[table_tag]
+    positioning_data: bytes = serialize_font(font=positioning_font)
+    positioning_font.close()
+    return positioning_data
+
+
 def detach_gsub_feature_variations(*, font: TTFont) -> bytes | None:
-    if "GSUB" not in font:
+    return detach_feature_variations(font=font, table_tag="GSUB")
+
+
+def detach_feature_variations(*, font: TTFont, table_tag: LayoutTableTag) -> bytes | None:
+    if table_tag not in font:
         return None
-    gsub = font["GSUB"].table
-    gsub.FeatureVariations = None
-    if gsub.Version == 0x00010001:
-        gsub.Version = 0x00010000
-    return font.getTableData("GSUB")
+    layout_table = font[table_tag].table
+    layout_table.FeatureVariations = None
+    if layout_table.Version == 0x00010001:
+        layout_table.Version = 0x00010000
+    return font.getTableData(table_tag)
+
+
+def retain_feature_variation_lookups(*, font: TTFont, table_tag: LayoutTableTag) -> None:
+    if table_tag not in font:
+        return
+    layout_table = font[table_tag].table
+    feature_variations = getattr(layout_table, "FeatureVariations", None)
+    if feature_variations is None:
+        return
+    direct_lookup_indices: list[int] = [
+        lookup_index
+        for variation_record in feature_variations.FeatureVariationRecord
+        for substitution_record in variation_record.FeatureTableSubstitution.SubstitutionRecord
+        for lookup_index in substitution_record.Feature.LookupListIndex
+    ]
+    lookup_indices: set[int] = set(layout_table.LookupList.closure_lookups(direct_lookup_indices))
+    if not lookup_indices:
+        return
+
+    existing_tags: set[str] = {feature_record.FeatureTag for feature_record in layout_table.FeatureList.FeatureRecord}
+    reservoir_tag: str = next(tag for tag in ("zzz~", "zz~0", "zz~1", "zz~2") if tag not in existing_tags)
+    feature_record: OtFeatureRecord = copy.deepcopy(layout_table.FeatureList.FeatureRecord[0])
+    feature: OtFeature = feature_record.Feature
+    feature.FeatureParams = None
+    feature.LookupListIndex = sorted(lookup_indices)
+    feature.LookupCount = len(feature.LookupListIndex)
+    feature_record.FeatureTag = reservoir_tag
+    feature_record.Feature = feature
+    layout_table.FeatureList.FeatureRecord.append(feature_record)
+    layout_table.FeatureList.FeatureCount = len(layout_table.FeatureList.FeatureRecord)
+    reservoir_feature_index: int = layout_table.FeatureList.FeatureCount - 1
+    for script_record in layout_table.ScriptList.ScriptRecord:
+        lang_sys = script_record.Script.DefaultLangSys
+        if lang_sys is None and script_record.Script.LangSysRecord:
+            lang_sys = script_record.Script.LangSysRecord[0].LangSys
+        if lang_sys is None:
+            continue
+        lang_sys.FeatureIndex.append(reservoir_feature_index)
+        lang_sys.FeatureCount = len(lang_sys.FeatureIndex)
+        break
 
 
 def add_gsub_feature_variations(
     *,
     font: TTFont,
-    plan: GsubFeatureVariationPlan,
+    plan: LayoutFeatureVariationPlan,
     base_upem: int,
 ) -> None:
-    if "GSUB" not in font:
-        raise FontBuildError("GSUB FeatureVariations를 추가할 baseline GSUB가 없습니다")
-    gsub: OtGsub = cast("OtGsub", font["GSUB"].table)
+    add_layout_feature_variations(
+        font=font,
+        plan=plan,
+        base_upem=base_upem,
+    )
+
+
+def add_gpos_feature_variations(
+    *,
+    font: TTFont,
+    plan: LayoutFeatureVariationPlan,
+    base_upem: int,
+) -> None:
+    add_layout_feature_variations(
+        font=font,
+        plan=plan,
+        base_upem=base_upem,
+    )
+
+
+def add_layout_feature_variations(
+    *,
+    font: TTFont,
+    plan: LayoutFeatureVariationPlan,
+    base_upem: int,
+) -> None:
+    table_tag: LayoutTableTag = plan.table_tag
+    if table_tag not in font:
+        raise FontBuildError(f"{table_tag} FeatureVariations를 추가할 baseline {table_tag}가 없습니다")
+    output_layout: OtGsub = cast("OtGsub", font[table_tag].table)
     variation_records: list[object] = []
-    with tempfile.TemporaryDirectory(prefix="custom-font-wizard-gsub-") as temporary_directory:
+    prefix: str = f"custom-font-wizard-{table_tag.lower()}-"
+    with tempfile.TemporaryDirectory(prefix=prefix) as temporary_directory:
         temporary_root: Path = Path(temporary_directory)
         for index, segment in enumerate(plan.segments):
-            snapshot_font: TTFont = build_merged_gsub_snapshot(
+            snapshot_font: TTFont = build_merged_layout_snapshot(
                 base_font_data=plan.base_source.font_data,
                 donor_font_data=plan.donor_source.font_data,
                 source_weight=segment.source_weight,
@@ -974,22 +1151,33 @@ def add_gsub_feature_variations(
             )
             try:
                 if snapshot_font.getGlyphOrder() != font.getGlyphOrder():
-                    raise FontBuildError("GSUB FeatureVariations snapshot의 glyph order가 output과 다릅니다")
-                substitution_records: list[object] = append_snapshot_features(
-                    output_gsub=gsub,
+                    raise FontBuildError(f"{table_tag} FeatureVariations snapshot의 glyph order가 output과 다릅니다")
+                substitution_records: list[object] = snapshot_feature_substitution_records(
+                    output_layout=output_layout,
                     snapshot_font=snapshot_font,
                     feature_tags=plan.feature_tags,
+                    table_tag=table_tag,
                 )
             finally:
                 snapshot_font.close()
             condition = buildConditionTable(0, segment.minimum, segment.maximum)
             variation_records.append(buildFeatureVariationRecord([condition], substitution_records))
 
-    gsub.Version = 0x00010001
-    gsub.FeatureVariations = buildFeatureVariations(variation_records)
+    output_layout.Version = 0x00010001
+    output_layout.FeatureVariations = buildFeatureVariations(variation_records)
+    if table_tag == "GPOS":
+        clear_feature_variation_reservoir(layout_table=output_layout)
 
 
-def build_merged_gsub_snapshot(
+def clear_feature_variation_reservoir(*, layout_table: OtGsub) -> None:
+    for feature_record in layout_table.FeatureList.FeatureRecord:
+        if feature_record.FeatureTag not in {"zzz~", "zz~0", "zz~1", "zz~2"}:
+            continue
+        feature_record.Feature.LookupListIndex = []
+        feature_record.Feature.LookupCount = 0
+
+
+def build_merged_layout_snapshot(
     *,
     base_font_data: bytes,
     donor_font_data: bytes,
@@ -1000,21 +1188,33 @@ def build_merged_gsub_snapshot(
 ) -> TTFont:
     base_variable_font: TTFont = TTFont(BytesIO(base_font_data), recalcTimestamp=False)
     donor_variable_font: TTFont = TTFont(BytesIO(donor_font_data), recalcTimestamp=False)
+    if cff2_has_no_var_store(font=base_variable_font):
+        base_variable_font = downgradeCFF2ToCFF(base_variable_font)
+    if cff2_has_no_var_store(font=donor_variable_font):
+        donor_variable_font = downgradeCFF2ToCFF(donor_variable_font)
+    base_is_cff2: bool = "CFF2" in base_variable_font
+    donor_is_cff2: bool = "CFF2" in donor_variable_font
     base_font: TTFont = instantiateVariableFont(
         base_variable_font,
         {"wght": source_weight},
         inplace=True,
         static=True,
+        downgradeCFF2=base_is_cff2,
     )
     donor_font: TTFont = instantiateVariableFont(
         donor_variable_font,
         {"wght": source_weight},
         inplace=True,
         static=True,
+        downgradeCFF2=donor_is_cff2,
     )
     scale_upem(donor_font, base_upem)
-    base_path: Path = temporary_root / f"base-{index:02d}.ttf"
-    donor_path: Path = temporary_root / f"donor-{index:02d}.ttf"
+    if "CFF " in base_font:
+        normalize_cff_master(font=base_font)
+    if "CFF " in donor_font:
+        normalize_cff_master(font=donor_font)
+    base_path: Path = temporary_root / f"base-{index:02d}.font"
+    donor_path: Path = temporary_root / f"donor-{index:02d}.font"
     base_font.save(base_path, reorderTables=True)
     donor_font.save(donor_path, reorderTables=True)
     base_font.close()
@@ -1022,36 +1222,46 @@ def build_merged_gsub_snapshot(
     return Merger().merge([str(base_path), str(donor_path)])
 
 
-def append_snapshot_features(
+def snapshot_feature_substitution_records(
     *,
-    output_gsub: OtGsub,
+    output_layout: OtGsub,
     snapshot_font: TTFont,
     feature_tags: frozenset[str],
+    table_tag: LayoutTableTag,
 ) -> list[object]:
-    snapshot_gsub: OtGsub = cast("OtGsub", snapshot_font["GSUB"].table)
-    snapshot_feature_records: list[OtFeatureRecord] = snapshot_gsub.FeatureList.FeatureRecord
-    output_feature_records: list[OtFeatureRecord] = output_gsub.FeatureList.FeatureRecord
+    snapshot_layout: OtGsub = cast("OtGsub", snapshot_font[table_tag].table)
+    snapshot_feature_records: list[OtFeatureRecord] = snapshot_layout.FeatureList.FeatureRecord
+    output_feature_records: list[OtFeatureRecord] = output_layout.FeatureList.FeatureRecord
+    if table_tag == "GPOS":
+        return reference_snapshot_features(
+            output_layout=output_layout,
+            output_feature_records=output_feature_records,
+            snapshot_layout=snapshot_layout,
+            snapshot_feature_records=snapshot_feature_records,
+            feature_tags=feature_tags,
+        )
+
     direct_lookup_indices: list[int] = [
         lookup_index
         for feature_record in snapshot_feature_records
         if feature_record.FeatureTag in feature_tags
         for lookup_index in feature_record.Feature.LookupListIndex
     ]
-    selected_lookup_indices: list[int] = snapshot_gsub.LookupList.closure_lookups(direct_lookup_indices)
-    output_lookup_offset: int = len(output_gsub.LookupList.Lookup)
+    selected_lookup_indices: list[int] = snapshot_layout.LookupList.closure_lookups(direct_lookup_indices)
+    output_lookup_offset: int = len(output_layout.LookupList.Lookup)
     lookup_index_map: dict[int, int] = {
         source_index: output_lookup_offset + target_index
         for target_index, source_index in enumerate(selected_lookup_indices)
     }
     lookup_copies: list[OtLookup] = [
-        copy.deepcopy(snapshot_gsub.LookupList.Lookup[source_index]) for source_index in selected_lookup_indices
+        copy.deepcopy(snapshot_layout.LookupList.Lookup[source_index]) for source_index in selected_lookup_indices
     ]
     for lookup in lookup_copies:
         lookup.subset_lookups(selected_lookup_indices)
     lookup_shifter = ShifterVisitor(output_lookup_offset)
     lookup_shifter.visit(lookup_copies)
-    output_gsub.LookupList.Lookup.extend(lookup_copies)
-    output_gsub.LookupList.LookupCount = len(output_gsub.LookupList.Lookup)
+    output_layout.LookupList.Lookup.extend(lookup_copies)
+    output_layout.LookupList.LookupCount = len(output_layout.LookupList.Lookup)
 
     substitution_records: list[object] = []
     for feature_tag in sorted(feature_tags):
@@ -1064,7 +1274,7 @@ def append_snapshot_features(
             feature_record for feature_record in snapshot_feature_records if feature_record.FeatureTag == feature_tag
         ]
         if snapshot_matches and len(snapshot_matches) != len(output_matches):
-            raise FontBuildError(f"GSUB FeatureVariations의 {feature_tag} feature 구성이 weight별로 다릅니다")
+            raise FontBuildError(f"{table_tag} FeatureVariations의 {feature_tag} feature 구성이 weight별로 다릅니다")
         for match_index, (feature_index, output_feature_record) in enumerate(output_matches):
             if snapshot_matches:
                 alternate_feature = copy.deepcopy(snapshot_matches[match_index].Feature)
@@ -1081,7 +1291,85 @@ def append_snapshot_features(
     return substitution_records
 
 
+def reference_snapshot_features(
+    *,
+    output_layout: OtGsub,
+    output_feature_records: list[OtFeatureRecord],
+    snapshot_layout: OtGsub,
+    snapshot_feature_records: list[OtFeatureRecord],
+    feature_tags: frozenset[str],
+) -> list[object]:
+    snapshot_reservoir: OtFeatureRecord = next(
+        feature_record
+        for feature_record in snapshot_feature_records
+        if feature_record.FeatureTag in {"zzz~", "zz~0", "zz~1", "zz~2"}
+    )
+    output_reservoir: OtFeatureRecord = next(
+        feature_record
+        for feature_record in output_feature_records
+        if feature_record.FeatureTag == snapshot_reservoir.FeatureTag
+    )
+    if len(snapshot_reservoir.Feature.LookupListIndex) != len(output_reservoir.Feature.LookupListIndex):
+        raise FontBuildError("GPOS FeatureVariations reservoir의 lookup 구성이 다릅니다")
+    lookup_index_map: dict[int, int] = dict(
+        zip(
+            snapshot_reservoir.Feature.LookupListIndex,
+            output_reservoir.Feature.LookupListIndex,
+            strict=True,
+        )
+    )
+
+    substitution_records: list[object] = []
+    for feature_tag in sorted(feature_tags):
+        output_matches: list[tuple[int, OtFeatureRecord]] = [
+            (feature_index, feature_record)
+            for feature_index, feature_record in enumerate(output_feature_records)
+            if feature_record.FeatureTag == feature_tag
+        ]
+        snapshot_matches: list[OtFeatureRecord] = [
+            feature_record for feature_record in snapshot_feature_records if feature_record.FeatureTag == feature_tag
+        ]
+        if snapshot_matches and len(snapshot_matches) != len(output_matches):
+            raise FontBuildError(f"GPOS FeatureVariations의 {feature_tag} feature 구성이 weight별로 다릅니다")
+        for match_index, (feature_index, output_feature_record) in enumerate(output_matches):
+            alternate_feature: OtFeature = copy.deepcopy(
+                snapshot_matches[match_index].Feature if snapshot_matches else output_feature_record.Feature
+            )
+            if snapshot_matches:
+                alternate_feature.LookupListIndex = [
+                    lookup_index_map[lookup_index] for lookup_index in alternate_feature.LookupListIndex
+                ]
+            else:
+                alternate_feature.LookupListIndex = []
+            alternate_feature.LookupCount = len(alternate_feature.LookupListIndex)
+            substitution_record: object = buildFeatureTableSubstitutionRecord(feature_index, [])
+            setattr(substitution_record, "Feature", alternate_feature)
+            substitution_records.append(substitution_record)
+    return substitution_records
+
+
 def prepare_variable_ttf_source(
+    *,
+    path: Path,
+    codepoints: set[int],
+    minimum: float,
+    default: float,
+    maximum: float,
+) -> TTFont:
+    font: TTFont = prepare_variable_source(
+        path=path,
+        codepoints=codepoints,
+        minimum=minimum,
+        default=default,
+        maximum=maximum,
+    )
+    if "gvar" not in font:
+        font.close()
+        raise FontBuildError("Variable TTF source에 gvar table이 없습니다")
+    return font
+
+
+def prepare_variable_source(
     *,
     path: Path,
     codepoints: set[int],
@@ -1095,9 +1383,10 @@ def prepare_variable_ttf_source(
     }
     axis_limits["wght"] = (minimum, default, maximum)
     font = instantiateVariableFont(font, axis_limits, inplace=True, static=False)
-    for glyph_name in font.getGlyphOrder():
-        if glyph_name not in font["gvar"].variations:
-            font["gvar"].variations[glyph_name] = []
+    if "gvar" in font:
+        for glyph_name in font.getGlyphOrder():
+            if glyph_name not in font["gvar"].variations:
+                font["gvar"].variations[glyph_name] = []
     subset_font(font=font, codepoints=codepoints)
     return font
 
@@ -1151,14 +1440,35 @@ def merge_variable_ttf(
         maximum=maximum,
     )
     try:
-        gsub_feature_variation_plan: GsubFeatureVariationPlan | None = build_gsub_feature_variation_plan(
+        retain_feature_variation_lookups(font=base_font, table_tag="GPOS")
+        retain_feature_variation_lookups(font=donor_font, table_tag="GPOS")
+        gsub_feature_variation_plan: LayoutFeatureVariationPlan | None = build_gsub_feature_variation_plan(
             base_font=base_font,
             donor_font=donor_font,
             source_axis=(minimum, default, maximum),
             output_axis=(minimum, default, maximum),
         )
+        gpos_feature_variation_plan: LayoutFeatureVariationPlan | None = build_gpos_feature_variation_plan(
+            base_font=base_font,
+            donor_font=donor_font,
+            source_axis=(minimum, default, maximum),
+            output_axis=(minimum, default, maximum),
+        )
+        positioning_weights: set[float] = {minimum, default, maximum}
+        for source_font in (base_font, donor_font):
+            positioning_weights.update(
+                collect_positioning_breakpoint_weights(
+                    font=source_font,
+                    minimum=minimum,
+                    maximum=maximum,
+                )
+            )
         detach_gsub_feature_variations(font=base_font)
         detach_gsub_feature_variations(font=donor_font)
+        detach_feature_variations(font=base_font, table_tag="GPOS")
+        detach_feature_variations(font=donor_font, table_tag="GPOS")
+        base_positioning_data: bytes = serialize_positioning_source(font=base_font)
+        donor_positioning_data: bytes = serialize_positioning_source(font=donor_font)
         replace_ttf_positioning_with_default(
             font=base_font,
             path=base_path,
@@ -1207,16 +1517,98 @@ def merge_variable_ttf(
             merged_gvar.variations.setdefault(glyph_name, [])
         merged_font["fvar"] = output_fvar
         merged_font["gvar"] = merged_gvar
+        positioning_font: TTFont = build_variable_positioning_from_masters(
+            base_font_data=base_positioning_data,
+            donor_font_data=donor_positioning_data,
+            weights=sorted(positioning_weights),
+            minimum=minimum,
+            default=default,
+            maximum=maximum,
+            base_upem=base_upem,
+            expected_glyph_order=expected_glyph_order,
+        )
+        try:
+            for table_tag in ("GDEF", "GPOS"):
+                table_data: bytes | None = (
+                    positioning_font.getTableData(table_tag) if table_tag in positioning_font else None
+                )
+                replace_table_data(font=merged_font, table_tag=table_tag, table_data=table_data)
+        finally:
+            positioning_font.close()
         if gsub_feature_variation_plan is not None:
             add_gsub_feature_variations(
                 font=merged_font,
                 plan=gsub_feature_variation_plan,
                 base_upem=base_upem,
             )
+        if gpos_feature_variation_plan is not None:
+            add_gpos_feature_variations(
+                font=merged_font,
+                plan=gpos_feature_variation_plan,
+                base_upem=base_upem,
+            )
         return merged_font
     finally:
         base_font.close()
         donor_font.close()
+
+
+def build_variable_positioning_from_masters(
+    *,
+    base_font_data: bytes,
+    donor_font_data: bytes,
+    weights: list[float],
+    minimum: float,
+    default: float,
+    maximum: float,
+    base_upem: int,
+    expected_glyph_order: list[str],
+) -> TTFont:
+    if len(weights) > 64:
+        raise FontBuildError("GPOS variation sample이 64개를 초과합니다")
+    with tempfile.TemporaryDirectory(prefix="custom-font-wizard-positioning-") as temporary_directory:
+        temporary_root: Path = Path(temporary_directory)
+        master_paths: list[tuple[float, Path]] = []
+        for index, weight in enumerate(weights):
+            base_master: TTFont = static_instance_from_data(
+                font_data=base_font_data,
+                weight=weight,
+                flavor="ttf",
+            )
+            donor_master: TTFont = static_instance_from_data(
+                font_data=donor_font_data,
+                weight=weight,
+                flavor="ttf",
+            )
+            scale_upem(donor_master, base_upem)
+            base_path: Path = temporary_root / f"base-{index:02d}.ttf"
+            donor_path: Path = temporary_root / f"donor-{index:02d}.ttf"
+            master_path: Path = temporary_root / f"master-{index:02d}.ttf"
+            base_master.save(base_path, reorderTables=True)
+            donor_master.save(donor_path, reorderTables=True)
+            base_master.close()
+            donor_master.close()
+            merged_master: TTFont = Merger().merge([str(base_path), str(donor_path)])
+            if merged_master.getGlyphOrder() != expected_glyph_order:
+                merged_master.close()
+                raise FontBuildError("GPOS variation master의 glyph order가 output과 다릅니다")
+            merged_master.save(master_path, reorderTables=True)
+            merged_master.close()
+            master_paths.append((weight, master_path))
+
+        designspace: DesignSpaceDocument = create_designspace(
+            master_paths=master_paths,
+            minimum=minimum,
+            default=default,
+            maximum=maximum,
+        )
+        excluded_tables: list[str] = ["gvar", "HVAR", "VVAR", "MVAR", "cvar", "CFF2"]
+        variable_font_result: tuple[TTFont, object, list[TTFont]] = build_variable_font(
+            designspace,
+            exclude=excluded_tables,
+        )
+        variable_font: TTFont = variable_font_result[0]
+        return variable_font
 
 
 def subset_font(*, font: TTFont, codepoints: set[int], glyphs: set[str] | None = None) -> None:
@@ -1264,10 +1656,98 @@ def collect_sample_weights(
             value: float | None = instance.coordinates.get("wght")
             if value is not None and effective_min <= value <= effective_max:
                 samples.add(float(value))
+        samples.update(
+            collect_positioning_breakpoint_weights(
+                font=font,
+                minimum=effective_min,
+                maximum=effective_max,
+            )
+        )
     ordered: list[float] = sorted(samples)
     if len(ordered) > 64:
         raise FontBuildError("wght sample이 64개를 초과합니다")
     return ordered
+
+
+def collect_positioning_breakpoint_weights(
+    *,
+    font: TTFont,
+    minimum: float,
+    maximum: float,
+) -> set[float]:
+    axis_tags: list[str] = [axis.axisTag for axis in font["fvar"].axes]
+    try:
+        weight_axis_index: int = axis_tags.index("wght")
+    except ValueError:
+        return set()
+
+    normalized_values: set[float] = {-1.0, 0.0, 1.0}
+    if "GDEF" in font:
+        var_store = getattr(font["GDEF"].table, "VarStore", None)
+        if var_store is not None:
+            for region in var_store.VarRegionList.Region:
+                if weight_axis_index >= len(region.VarRegionAxis):
+                    continue
+                axis_region = region.VarRegionAxis[weight_axis_index]
+                normalized_values.update(
+                    (
+                        float(axis_region.StartCoord),
+                        float(axis_region.PeakCoord),
+                        float(axis_region.EndCoord),
+                    )
+                )
+    if "GPOS" in font:
+        feature_variations = getattr(font["GPOS"].table, "FeatureVariations", None)
+        if feature_variations is not None:
+            for variation_record in feature_variations.FeatureVariationRecord:
+                for condition in variation_record.ConditionSet.ConditionTable:
+                    if condition.Format == 1 and condition.AxisIndex == weight_axis_index:
+                        normalized_values.add(float(condition.FilterRangeMinValue))
+                        normalized_values.add(float(condition.FilterRangeMaxValue))
+
+    external_normalized_values: set[float] = set()
+    for normalized_value in normalized_values:
+        external_normalized_values.update(
+            inverse_avar_coordinates(
+                font=font,
+                axis_tag="wght",
+                internal_value=normalized_value,
+            )
+        )
+    if "avar" in font:
+        segment_map: dict[float, float] = font["avar"].segments.get("wght", {})
+        external_normalized_values.update(float(value) for value in segment_map)
+
+    axis: tuple[float, float, float] = weight_axis_values(font=font)
+    return {
+        weight
+        for normalized_value in external_normalized_values
+        if minimum <= (weight := denormalize_weight(value=normalized_value, axis=axis)) <= maximum
+    }
+
+
+def inverse_avar_coordinates(*, font: TTFont, axis_tag: str, internal_value: float) -> set[float]:
+    if "avar" not in font:
+        return {internal_value}
+    segment_map: dict[float, float] = font["avar"].segments.get(axis_tag, {})
+    if not segment_map:
+        return {internal_value}
+
+    coordinates: set[float] = set()
+    ordered_points: list[tuple[float, float]] = sorted(
+        (float(external), float(internal)) for external, internal in segment_map.items()
+    )
+    for (external_start, internal_start), (external_end, internal_end) in pairwise(ordered_points):
+        lower: float = min(internal_start, internal_end)
+        upper: float = max(internal_start, internal_end)
+        if not lower <= internal_value <= upper:
+            continue
+        if internal_start == internal_end:
+            coordinates.update((external_start, external_end))
+            continue
+        ratio: float = (internal_value - internal_start) / (internal_end - internal_start)
+        coordinates.add(external_start + ratio * (external_end - external_start))
+    return coordinates or {internal_value}
 
 
 def collect_named_weight_styles(
@@ -1340,73 +1820,6 @@ def create_designspace(
             source.copyFeatures = True
         designspace.addSource(source)
     return designspace
-
-
-def allocate_cff_names(*, font: TTFont, codepoints: set[int]) -> dict[int, str]:
-    top_dict = font["CFF "].cff.topDictIndex[0]
-    if hasattr(top_dict, "FDArray"):
-        used_cids: set[int] = {int(name[3:]) for name in top_dict.charset if re.fullmatch(r"cid\d+", name) is not None}
-        available_cids: Iterable[int] = (cid for cid in range(1, 65536) if cid not in used_cids)
-        names: dict[int, str] = {}
-        for codepoint, cid in zip(sorted(codepoints), available_cids, strict=False):
-            names[codepoint] = f"cid{cid:05d}"
-        if len(names) != len(codepoints):
-            raise FontBuildError("CID-keyed CFF2에 donor glyph를 추가할 CID 공간이 부족합니다")
-        return names
-    return {codepoint: f"cfw{codepoint:06X}" for codepoint in sorted(codepoints)}
-
-
-def append_cff_glyphs(
-    *,
-    base_font: TTFont,
-    donor_font: TTFont,
-    codepoints: set[int],
-    target_names: dict[int, str],
-) -> None:
-    if not codepoints:
-        return
-    base_cff = base_font["CFF "].cff
-    top_dict = base_cff.topDictIndex[0]
-    donor_cmap: dict[int, str] = dict(donor_font.getBestCmap() or {})
-    donor_glyph_set = donor_font.getGlyphSet()
-    glyph_order: list[str] = list(base_font.getGlyphOrder())
-
-    for codepoint in sorted(codepoints):
-        donor_name: str = donor_cmap[codepoint]
-        target_name: str = target_names[codepoint]
-        advance_width: int = int(donor_font["hmtx"].metrics[donor_name][0])
-        pen = T2CharStringPen(width=advance_width, glyphSet=None, CFF2=False)
-        donor_glyph_set[donor_name].draw(pen)
-        if hasattr(top_dict, "FDArray"):
-            fd_index: int | None = 0
-            private_dict = top_dict.FDArray[fd_index].Private
-        else:
-            fd_index = None
-            private_dict = top_dict.Private
-        char_string = pen.getCharString(private=private_dict, globalSubrs=[])
-        char_strings_index = top_dict.CharStrings.charStringsIndex
-        char_strings_index.append(char_string)
-        top_dict.CharStrings.charStrings[target_name] = len(char_strings_index) - 1
-        top_dict.charset.append(target_name)
-        if fd_index is not None:
-            top_dict.FDSelect.gidArray.append(fd_index)
-        glyph_order.append(target_name)
-        base_font["hmtx"].metrics[target_name] = donor_font["hmtx"].metrics[donor_name]
-        add_cmap_mapping(font=base_font, codepoint=codepoint, glyph_name=target_name)
-
-    base_font.setGlyphOrder(glyph_order)
-    base_font["maxp"].numGlyphs = len(glyph_order)
-
-
-def add_cmap_mapping(*, font: TTFont, codepoint: int, glyph_name: str) -> None:
-    mapped: bool = False
-    for cmap_table in font["cmap"].tables:
-        if cmap_table.isUnicode() and hasattr(cmap_table, "cmap"):
-            if codepoint <= 0xFFFF or cmap_table.format in {12, 13}:
-                cmap_table.cmap[codepoint] = glyph_name
-                mapped = True
-    if not mapped:
-        raise FontBuildError(f"U+{codepoint:04X}를 표현할 Unicode cmap format이 없습니다")
 
 
 def update_names(

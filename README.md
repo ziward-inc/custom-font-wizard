@@ -124,9 +124,9 @@ TTF output range가 Base range 안에 있고 source에 별도 metric/axis variat
 ## 현재 제약
 
 - output은 안전한 subset/merge를 위해 dehinted font로 생성됩니다.
-- TTF는 subset된 Base/Donor layout table을 merge합니다. Base와 Donor의 weight-dependent `GSUB FeatureVariations`는 output `wght` condition에 맞춰 재구성하며 `SingleSubst`, `MultipleSubst`, `AlternateSubst`, `LigatureSubst`, contextual lookup과 Extension lookup을 포함한 전체 alternate feature lookup graph를 보존합니다.
-- TTF의 static `GPOS` rule은 merge하지만 source의 weight-dependent `GPOS` variation 구조를 그대로 결합하지는 않습니다. direct TTF path는 output default weight의 static `GPOS`를 사용하고, Static master fallback은 master별 값을 `fontTools.varLib`으로 다시 interpolation합니다. `GPOS FeatureVariations`도 output에 재구성하지 않습니다.
-- OTF(CFF2)는 Base layout table을 유지하지만 새로 붙인 Donor glyph의 Donor `GSUB`/`GPOS` rule은 옮기지 않습니다. Donor의 contextual shaping이 필요한 script에는 현재 OTF path를 사용하지 않는 편이 안전합니다.
+- TTF와 OTF 모두 subset dependency glyph와 Base/Donor의 `GSUB`, `GPOS`, `GDEF`를 merge합니다. OTF static master는 CID-keyed CFF를 포함해 dehinted name-keyed CFF로 normalize한 뒤 layout과 outline을 함께 merge하고 `fontTools.varLib`으로 CFF2 output을 구성합니다.
+- Base와 Donor의 weight-dependent `GSUB FeatureVariations`와 `GPOS FeatureVariations`는 output `wght` condition에 맞춰 재구성합니다. `SingleSubst`, `MultipleSubst`, `AlternateSubst`, `LigatureSubst`, positioning, contextual lookup과 Extension lookup을 포함한 전체 alternate feature lookup graph를 보존합니다.
+- GPOS의 `VariationIndex`가 참조하는 `GDEF VarStore` region과 `avar` kink를 weight sample에 포함해 positioning 값을 재구성합니다. direct TTF path는 source `gvar/fvar`를 직접 결합한 뒤 이 GPOS/GDEF 결과만 교체하므로 outline variation 구조는 그대로 유지합니다.
 - Static master fallback에서 큰 CJK group을 선택하면 여러 master의 모든 outline을 처리하므로 build에 시간이 걸리고 output 용량이 커질 수 있습니다.
 
 ## 검증
