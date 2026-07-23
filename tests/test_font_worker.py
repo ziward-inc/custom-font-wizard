@@ -90,6 +90,31 @@ class FontWorkerTests(unittest.TestCase):
                 )
                 self.assertEqual(minimum_outline, source_minimum_outline)
 
+    def test_build_allows_source_family_names(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
+            for source_path in (BASE_TTF, DONOR_TTF):
+                source_font: TTFont = TTFont(source_path)
+                family_name: str | None = source_font["name"].getDebugName(16) or source_font["name"].getDebugName(1)
+                source_font.close()
+                self.assertIsNotNone(family_name)
+                assert family_name is not None
+
+                with self.subTest(family_name=family_name):
+                    output_path: Path = Path(temporary_directory) / f"{source_path.stem}-Family.ttf"
+                    build_font(
+                        base_path=BASE_TTF,
+                        donor_path=DONOR_TTF,
+                        output_path=output_path,
+                        family_name=family_name,
+                        weight_min=300,
+                        weight_max=400,
+                        selected_codepoints=[0x0041],
+                    )
+
+                    font: TTFont = TTFont(output_path)
+                    self.assertEqual(font["name"].getDebugName(16), family_name)
+                    font.close()
+
     def test_build_uses_default_weight_donor_gsub_across_masters(self) -> None:
         with tempfile.TemporaryDirectory(prefix="custom-font-wizard-test-") as temporary_directory:
             output_path: Path = Path(temporary_directory) / "Kana.ttf"

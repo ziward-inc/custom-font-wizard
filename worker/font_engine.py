@@ -136,10 +136,9 @@ def build_font(
     )
     analysis: dict[str, object] = analyze_fonts(base_path=base_path, donor_path=donor_path)
     base_info: dict[str, object] = require_object(value=analysis["base"], label="base analysis")
-    donor_info: dict[str, object] = require_object(value=analysis["donor"], label="donor analysis")
     flavor: FontFlavor = require_flavor(value=base_info["flavor"])
     validate_output_suffix(output_path=output_path, flavor=flavor)
-    validate_family_name(family_name=family_name, base_info=base_info, donor_info=donor_info)
+    validate_family_name(family_name=family_name)
     report_progress(
         progress=progress,
         step="analyze_sources",
@@ -1030,16 +1029,9 @@ def validate_output_suffix(*, output_path: Path, flavor: FontFlavor) -> None:
         raise FontBuildError(f"Output extension은 {expected_suffix}여야 합니다")
 
 
-def validate_family_name(*, family_name: str, base_info: dict[str, object], donor_info: dict[str, object]) -> None:
-    normalized: str = family_name.strip().casefold()
-    if not normalized:
+def validate_family_name(*, family_name: str) -> None:
+    if not family_name.strip():
         raise FontBuildError("Family name이 비어 있습니다")
-    source_names: set[str] = {
-        str(base_info["family"]).strip().casefold(),
-        str(donor_info["family"]).strip().casefold(),
-    }
-    if normalized in source_names:
-        raise FontBuildError("합성 font에는 Base 또는 Donor와 다른 family name을 사용해야 합니다")
 
 
 def name_value(*, font: TTFont, name_id: int) -> str:
